@@ -1,0 +1,562 @@
+/* ================================================================
+   APPS SCRIPT: Agendamento no Google Agenda + Planilha de leads
+   ================================================================
+   VERSAO: v6 (09/07/2026) - sucesso da criacao nunca mais vira falso
+   erro: passos secundarios (planilha, e-mail, cache) nao derrubam a
+   resposta; contrato de resposta claro (sucesso true/false + motivo)
+
+   Responsabilidades:
+   1) "slots"   -> devolve os horarios livres dos proximos dias uteis,
+                   lendo a agenda em tempo real.
+   2) "agendar" -> cria o evento no Google Agenda quando o lead
+                   confirma, com trava forte contra duplicacao.
+   3) "salvar"  -> grava/atualiza a linha do lead na planilha a cada
+                   etapa (qualificado, nao qualificado ou agendado).
+
+   COMO USAR: cole este arquivo INTEIRO no editor do Apps Script
+   (Extensoes > Apps Script), apagando o conteudo anterior. Depois
+   publique em Implantar > Gerenciar implantacoes > editar (lapis) >
+   Versao: Nova versao > Implantar.
+
+   FERRAMENTAS DE DIAGNOSTICO (rode pelo menu ao lado de "Executar"):
+   - VERSAO()          -> confirma que esta versao esta publicada.
+   - conferirAgenda()  -> mostra o que existe na sua agenda no dia/hora
+                          configurado em DEBUG_DATA / DEBUG_HORA.
+   - limparEventosDeTeste() -> apaga da agenda os eventos criados pelo
+                          formulario dentro da janela, para zerar os
+                          testes. LEIA o aviso na propria funcao.
+   ================================================================ */
+
+
+/* ================================================================
+   1. CONFIGURACOES
+   ================================================================ */
+
+// Agenda usada. 'primary' = agenda principal da conta que publicar.
+var CALENDAR_ID = 'primary';
+
+// Nome da aba da planilha onde as respostas sao gravadas.
+var SHEET_NAME = 'Respostas';
+
+// Seu e-mail, para onde vai o aviso de cada novo agendamento.
+var NOTIFICATION_EMAIL = 'ravisrocha@gmail.com';
+
+// Dias disponiveis. Domingo=0 ... Sabado=6. [1,2,3,4,5] = seg a sex.
+var WORK_DAYS = [1, 2, 3, 4, 5];
+
+// Horarios oferecidos em cada dia util (24h).
+var SLOT_TIMES = [
+  '10:00', '10:30', '11:00',
+  '14:00', '14:30', '15:00', '15:30', '16:00', '16:30', '17:00'
+];
+
+// Duracao de cada reuniao, em minutos.
+var SLOT_DURATION_MIN = 30;
+
+// Quantos dias uteis para frente ficam disponiveis.
+var ADVANCE_BUSINESS_DAYS = 14;
+
+// Aviso minimo, em horas, antes de um horario poder ser escolhido.
+var MIN_NOTICE_HOURS = 2;
+
+// Titulo dos eventos criados pelo formulario (aparece no seu
+// Google Agenda, pode ter acentos normalmente).
+var EVENT_TITLE_DISPLAY = 'Consultoria gratuita de tráfego pago';
+
+// Prefixo usado só para RECONHECER se um evento foi criado por este
+// formulario (limpeza de testes e anti-duplicacao). Fica curto e
+// sem acentos de propósito, para nunca falhar por causa de acento
+// ou codificação de caracteres, nem em eventos criados por versões
+// anteriores do código.
+var EVENT_TITLE_PREFIX = 'Consultoria gratuita';
+
+// Link automatico de Google Meet. Exige o servico avancado
+// "Google Calendar API" habilitado. Deixe false se nao ativou.
+var ADD_GOOGLE_MEET = false;
+
+// Fuso horario usado na criacao de eventos via Google Calendar API
+// (caminho do Google Meet). Fixado explicitamente para nao depender
+// da configuracao do projeto.
+var TIMEZONE = 'America/Fortaleza';
+
+// Dia/hora usados APENAS pela ferramenta conferirAgenda().
+var DEBUG_DATA = '2026-07-15';
+var DEBUG_HORA = '11:00';
+
+
+/* ================================================================
+   2. FERRAMENTAS DE DIAGNOSTICO (uso manual no editor)
+   ================================================================ */
+
+function VERSAO() {
+  Logger.log('v6 (09/07/2026)');
+  Logger.log('Fuso do projeto: ' + Session.getScriptTimeZone());
+  Logger.log('Fuso esperado: America/Fortaleza (ou equivalente GMT-3). Se estiver diferente, ajuste em Configuracoes do projeto.');
+}
+
+/* Mostra, no Registro de execucao, tudo o que existe na sua agenda
+   no intervalo do horario configurado em DEBUG_DATA / DEBUG_HORA.
+   Use para descobrir o que esta bloqueando um horario especifico. */
+function conferirAgenda() {
+  var calendario = CalendarApp.getCalendarById(CALENDAR_ID);
+  var inicio = construirDataHora(DEBUG_DATA, DEBUG_HORA);
+  var fim = new Date(inicio.getTime() + SLOT_DURATION_MIN * 60000);
+
+  Logger.log('Conferindo ' + DEBUG_DATA + ' as ' + DEBUG_HORA);
+  Logger.log('Intervalo: ' + inicio + '  ate  ' + fim);
+
+  var eventos = calendario.getEvents(inicio, fim);
+  Logger.log('Eventos encontrados nesse intervalo: ' + eventos.length);
+
+  if (eventos.length === 0) {
+    Logger.log('>> Horario LIVRE. Deveria permitir agendamento normalmente.');
+    return;
+  }
+
+  for (var i = 0; i < eventos.length; i++) {
+    var e = eventos[i];
+    Logger.log(
+      (i + 1) + ') "' + e.getTitle() + '"' +
+      '  inicio: ' + e.getStartTime() +
+      '  fim: ' + e.getEndTime() +
+      '  diaInteiro: ' + e.isAllDayEvent()
+    );
+  }
+  Logger.log('>> Se algum desses e um teste antigo, rode limparEventosDeTeste().');
+}
+
+/* Apaga da agenda os eventos criados por ESTE formulario (que
+   comecam com EVENT_TITLE_PREFIX) dentro da janela de dias
+   configurada. Serve para zerar os testes acumulados.
+   ATENCAO: so remove eventos cujo titulo comeca com o prefixo do
+   formulario. Nao mexe em nenhum outro compromisso da sua agenda.
+   Rode manualmente e confira o log com a lista do que foi apagado. */
+function limparEventosDeTeste() {
+  var calendario = CalendarApp.getCalendarById(CALENDAR_ID);
+
+  var inicioJanela = new Date();
+  inicioJanela.setHours(0, 0, 0, 0);
+
+  var fimJanela = new Date();
+  fimJanela.setDate(fimJanela.getDate() + 60);
+  fimJanela.setHours(23, 59, 59, 999);
+
+  var eventos = calendario.getEvents(inicioJanela, fimJanela);
+  var apagados = 0;
+
+  for (var i = 0; i < eventos.length; i++) {
+    var titulo = eventos[i].getTitle() || '';
+    if (titulo.indexOf(EVENT_TITLE_PREFIX) === 0) {
+      Logger.log('Apagando: "' + titulo + '" em ' + eventos[i].getStartTime());
+      eventos[i].deleteEvent();
+      apagados++;
+    }
+  }
+
+  Logger.log('Total de eventos de teste apagados: ' + apagados);
+}
+
+
+/* ================================================================
+   3. ROTEAMENTO: GET (consultar) e POST (salvar / agendar)
+   ================================================================ */
+
+function doGet(e) {
+  try {
+    if (e && e.parameter && e.parameter.action === 'slots') {
+      return jsonResponse({ ok: true, dias: getAvailability() });
+    }
+    return jsonResponse({ ok: false, erro: 'acao_invalida' });
+  } catch (erro) {
+    return jsonResponse({ ok: false, erro: String(erro) });
+  }
+}
+
+function doPost(e) {
+  try {
+    var dados = JSON.parse(e.postData.contents);
+
+    if (dados.action === 'salvar') {
+      salvarResposta(dados);
+      return jsonResponse({ ok: true, sucesso: true });
+    }
+
+    if (dados.action === 'agendar') {
+      return jsonResponse(agendarComTrava(dados));
+    }
+
+    return jsonResponse({ ok: false, sucesso: false, motivo: 'acao_invalida' });
+  } catch (erro) {
+    // Erro interno inesperado: identificado com motivo proprio, para
+    // o formulario NUNCA confundir isso com horario indisponivel.
+    return jsonResponse({ ok: false, sucesso: false, motivo: 'erro_interno', detalhe: String(erro) });
+  }
+}
+
+function jsonResponse(objeto) {
+  return ContentService
+    .createTextOutput(JSON.stringify(objeto))
+    .setMimeType(ContentService.MimeType.JSON);
+}
+
+
+/* ================================================================
+   4. DISPONIBILIDADE
+   Uma unica leitura da agenda cobrindo a janela inteira, e o
+   restante resolvido em memoria (rapido).
+   ================================================================ */
+
+function getAvailability() {
+  var calendario = CalendarApp.getCalendarById(CALENDAR_ID);
+  var resultado = {};
+
+  var limiteMinimo = new Date(Date.now() + MIN_NOTICE_HOURS * 3600000);
+
+  // Lista dos proximos dias uteis.
+  var diasUteis = [];
+  var cursor = new Date();
+  cursor.setHours(0, 0, 0, 0);
+  var trava = 0;
+  while (diasUteis.length < ADVANCE_BUSINESS_DAYS && trava < 120) {
+    trava++;
+    if (WORK_DAYS.indexOf(cursor.getDay()) !== -1) {
+      diasUteis.push(new Date(cursor));
+    }
+    cursor.setDate(cursor.getDate() + 1);
+  }
+
+  // Uma unica consulta a agenda, cobrindo toda a janela.
+  var inicioJanela = new Date(diasUteis[0]);
+  var fimJanela = new Date(diasUteis[diasUteis.length - 1]);
+  fimJanela.setHours(23, 59, 59, 999);
+
+  var eventos = calendario.getEvents(inicioJanela, fimJanela);
+
+  // Guarda so os intervalos ocupados (ignorando eventos de dia
+  // inteiro, que nao sao compromissos com hora marcada).
+  var ocupados = [];
+  for (var e = 0; e < eventos.length; e++) {
+    if (eventos[e].isAllDayEvent()) continue;
+    ocupados.push([
+      eventos[e].getStartTime().getTime(),
+      eventos[e].getEndTime().getTime()
+    ]);
+  }
+
+  // Para cada dia e cada horario, checa sobreposicao em memoria.
+  for (var d = 0; d < diasUteis.length; d++) {
+    var chave = formatarDataChave(diasUteis[d]);
+    var livres = [];
+
+    for (var i = 0; i < SLOT_TIMES.length; i++) {
+      var inicio = construirDataHora(chave, SLOT_TIMES[i]);
+      if (inicio < limiteMinimo) continue;
+
+      var iniMs = inicio.getTime();
+      var fimMs = iniMs + SLOT_DURATION_MIN * 60000;
+
+      var livre = true;
+      for (var o = 0; o < ocupados.length; o++) {
+        if (ocupados[o][0] < fimMs && ocupados[o][1] > iniMs) {
+          livre = false;
+          break;
+        }
+      }
+      if (livre) livres.push(SLOT_TIMES[i]);
+    }
+
+    resultado[chave] = livres;
+  }
+
+  return resultado;
+}
+
+
+/* ================================================================
+   5. AGENDAMENTO (com trava e anti-duplicacao)
+   ================================================================ */
+
+/* Envolve o agendamento numa trava global: dois pedidos nunca sao
+   processados ao mesmo tempo. Assim, mesmo dois cliques quase
+   simultaneos (ou a pagina recarregada) sao tratados em sequencia,
+   e a checagem de duplicacao dentro de agendarReuniao funciona sem
+   condicao de corrida. */
+function agendarComTrava(dados) {
+  var trava = LockService.getScriptLock();
+  try {
+    trava.waitLock(25000);
+  } catch (erro) {
+    return { ok: false, sucesso: false, motivo: 'sistema_ocupado_tente_novamente' };
+  }
+
+  try {
+    return agendarReuniao(dados);
+  } finally {
+    trava.releaseLock();
+  }
+}
+
+function agendarReuniao(dados) {
+  var calendario = CalendarApp.getCalendarById(CALENDAR_ID);
+
+  var inicio = construirDataHora(dados.date, dados.time);
+  var fim = new Date(inicio.getTime() + SLOT_DURATION_MIN * 60000);
+
+  // --- Anti-duplicacao (2 camadas) ---
+  // Camada A: marca em cache por sessao + horario. Se a mesma sessao
+  // ja confirmou exatamente este dia/horario, apenas confirma de
+  // novo (a primeira tentativa deu certo, so a resposta demorou).
+  var cache = CacheService.getScriptCache();
+  var chaveSessao = 'ag_' + dados.sessionId + '_' + dados.date + '_' + dados.time;
+  if (cache.get(chaveSessao) === '1') {
+    return { ok: true, sucesso: true, jaAgendado: true };
+  }
+
+  // Camada B: procura se JA EXISTE um evento deste formulario neste
+  // exato horario (mesmo titulo/prefixo, mesmo inicio). Se existir,
+  // foi esta pessoa que criou numa tentativa anterior: confirma de
+  // novo sem duplicar. Isso cobre o caso de a pagina recarregar e
+  // perder o cache/sessao.
+  var noHorario = calendario.getEvents(inicio, fim);
+  var jaCriadoPeloFormulario = false;
+  var conflitoExterno = [];
+
+  for (var i = 0; i < noHorario.length; i++) {
+    var ev = noHorario[i];
+    if (ev.isAllDayEvent()) continue; // dia inteiro nao bloqueia
+
+    var mesmoInicio = ev.getStartTime().getTime() === inicio.getTime();
+    var ehDoFormulario = (ev.getTitle() || '').indexOf(EVENT_TITLE_PREFIX) === 0;
+
+    if (ehDoFormulario && mesmoInicio) {
+      jaCriadoPeloFormulario = true;
+    } else {
+      conflitoExterno.push(ev.getTitle() + ' | ' + ev.getStartTime() + ' - ' + ev.getEndTime());
+    }
+  }
+
+  if (jaCriadoPeloFormulario) {
+    try { cache.put(chaveSessao, '1', 21600); } catch (e1) { console.log('Aviso: falha no cache (ignorada): ' + e1); }
+    return { ok: true, sucesso: true, jaAgendado: true };
+  }
+
+  // Conflito real: existe outro compromisso (nao de dia inteiro e
+  // que nao foi criado por este formulario) ocupando o horario.
+  if (conflitoExterno.length > 0) {
+    console.log('Conflito real em ' + dados.date + ' ' + dados.time + ' -> ' + conflitoExterno.join('  ///  '));
+    return { ok: false, sucesso: false, motivo: 'horario_indisponivel' };
+  }
+
+  // --- Horario livre: cria o evento ---
+  var titulo = EVENT_TITLE_DISPLAY + ' - ' + (dados.nome || 'Lead do formulario');
+  var descricao = montarDescricaoEvento(dados);
+
+  if (ADD_GOOGLE_MEET) {
+    criarEventoComGoogleMeet(inicio, fim, titulo, descricao, dados.email);
+  } else {
+    var opcoes = { description: descricao };
+    if (dados.email) {
+      opcoes.guests = dados.email;
+      opcoes.sendInvite = true;
+    }
+    calendario.createEvent(titulo, inicio, fim, opcoes);
+  }
+
+  /* =============================================================
+     A PARTIR DAQUI O AGENDAMENTO JA E UM SUCESSO.
+     O evento esta criado no Google Agenda. Os passos abaixo sao
+     secundarios (cache, planilha, e-mail de aviso): se qualquer um
+     deles falhar, a falha e registrada no log e IGNORADA. Em
+     hipotese alguma uma falha aqui pode transformar um agendamento
+     bem-sucedido em mensagem de erro para o lead. Era exatamente
+     isso que causava o falso "horario reservado por outra pessoa".
+     ============================================================= */
+
+  try {
+    cache.put(chaveSessao, '1', 21600);
+  } catch (e2) {
+    console.log('Aviso: falha ao gravar cache (ignorada): ' + e2);
+  }
+
+  try {
+    salvarResposta({
+      sessionId: dados.sessionId,
+      nome: dados.nome,
+      whatsapp: dados.whatsapp,
+      email: dados.email,
+      faturamento: dados.faturamento,
+      sobre: dados.sobre,
+      instagram: dados.instagram,
+      qual1: dados.qual1,
+      qual2: dados.qual2,
+      status: 'Agendado',
+      dataAgendada: dados.date,
+      horarioAgendado: dados.time
+    });
+  } catch (e3) {
+    console.log('Aviso: falha ao gravar na planilha (ignorada): ' + e3);
+  }
+
+  try {
+    notificarNovoAgendamento(dados);
+  } catch (e4) {
+    console.log('Aviso: falha ao enviar e-mail de aviso (ignorada): ' + e4);
+  }
+
+  return { ok: true, sucesso: true };
+}
+
+function montarDescricaoEvento(dados) {
+  return [
+    'Lead vindo do formulario de qualificacao.',
+    '',
+    'WhatsApp: ' + (dados.whatsapp || ''),
+    'E-mail: ' + (dados.email || ''),
+    'Faturamento mensal: ' + (dados.faturamento || ''),
+    'Instagram: ' + (dados.instagram || ''),
+    '',
+    'Sobre a empresa:',
+    (dados.sobre || ''),
+    '',
+    'Investimento em anuncios (R$ 900/mes): ' + (dados.qual1 || ''),
+    'Investimento total (R$ 1.900/mes): ' + (dados.qual2 || '')
+  ].join('\n');
+}
+
+function criarEventoComGoogleMeet(inicio, fim, titulo, descricao, email) {
+  var evento = {
+    summary: titulo,
+    description: descricao,
+    start: { dateTime: inicio.toISOString(), timeZone: TIMEZONE },
+    end: { dateTime: fim.toISOString(), timeZone: TIMEZONE },
+    conferenceData: {
+      createRequest: {
+        requestId: Utilities.getUuid(),
+        conferenceSolutionKey: { type: 'hangoutsMeet' }
+      }
+    }
+  };
+
+  var opcoesInsercao = { conferenceDataVersion: 1 };
+  if (email) {
+    evento.attendees = [{ email: email }];
+    opcoesInsercao.sendUpdates = 'all';
+  }
+
+  Calendar.Events.insert(evento, CALENDAR_ID, opcoesInsercao);
+}
+
+function notificarNovoAgendamento(dados) {
+  if (!NOTIFICATION_EMAIL) return;
+
+  var partes = String(dados.date).split('-');
+  var dataFormatada = partes[2] + '/' + partes[1] + '/' + partes[0];
+
+  var assunto = 'Novo agendamento: ' + (dados.nome || 'Lead') + ' - ' + dataFormatada + ' as ' + dados.time;
+  var corpo = [
+    'Novo agendamento confirmado pelo formulario!',
+    '',
+    'Nome: ' + (dados.nome || ''),
+    'WhatsApp: ' + (dados.whatsapp || ''),
+    'E-mail: ' + (dados.email || ''),
+    'Data: ' + dataFormatada,
+    'Horario: ' + (dados.time || ''),
+    '',
+    'Faturamento mensal: ' + (dados.faturamento || ''),
+    'Instagram: ' + (dados.instagram || ''),
+    '',
+    'Sobre a empresa:',
+    (dados.sobre || ''),
+    '',
+    'Investimento em anuncios (R$ 900/mes): ' + (dados.qual1 || ''),
+    'Investimento total (R$ 1.900/mes): ' + (dados.qual2 || '')
+  ].join('\n');
+
+  MailApp.sendEmail(NOTIFICATION_EMAIL, assunto, corpo);
+}
+
+
+/* ================================================================
+   6. PLANILHA
+   ================================================================ */
+
+function salvarResposta(dados) {
+  var arquivo = SpreadsheetApp.getActiveSpreadsheet();
+  var planilha = arquivo.getSheetByName(SHEET_NAME);
+
+  // Se a aba nao existir (nome diferente, apagada, etc.), cria na
+  // hora com os cabecalhos certos, em vez de estourar erro.
+  if (!planilha) {
+    planilha = arquivo.insertSheet(SHEET_NAME);
+    planilha.appendRow([
+      'ID da Sessao', 'Data e Hora', 'Nome', 'WhatsApp', 'E-mail',
+      'Faturamento', 'Sobre a Empresa', 'Instagram',
+      'Qualificacao Anuncio', 'Qualificacao Mao de Obra',
+      'Status', 'Data Agendada', 'Horario Agendado'
+    ]);
+  }
+
+  var linhas = planilha.getDataRange().getValues();
+  var linhaEncontrada = -1;
+
+  for (var i = 1; i < linhas.length; i++) {
+    if (linhas[i][0] === dados.sessionId) {
+      linhaEncontrada = i + 1;
+      break;
+    }
+  }
+
+  // Ordem das colunas (A ate M):
+  // ID da Sessao | Data e Hora | Nome | WhatsApp | E-mail |
+  // Faturamento | Sobre a Empresa | Instagram | Qualificacao Anuncio |
+  // Qualificacao Mao de Obra | Status | Data Agendada | Horario Agendado
+  var novaLinha = [
+    dados.sessionId || '',
+    new Date(),
+    dados.nome || '',
+    dados.whatsapp || '',
+    dados.email || '',
+    dados.faturamento || '',
+    dados.sobre || '',
+    dados.instagram || '',
+    dados.qual1 || '',
+    dados.qual2 || '',
+    dados.status || '',
+    dados.dataAgendada || '',
+    dados.horarioAgendado || ''
+  ];
+
+  if (linhaEncontrada > 0) {
+    planilha.getRange(linhaEncontrada, 1, 1, novaLinha.length).setValues([novaLinha]);
+  } else {
+    planilha.appendRow(novaLinha);
+  }
+}
+
+
+/* ================================================================
+   7. UTILITARIOS DE DATA (compartilhados)
+   ================================================================ */
+
+function formatarDataChave(data) {
+  var ano = data.getFullYear();
+  var mes = ('0' + (data.getMonth() + 1)).slice(-2);
+  var dia = ('0' + data.getDate()).slice(-2);
+  return ano + '-' + mes + '-' + dia;
+}
+
+/* Constroi o Date de um horario a partir de "yyyy-mm-dd" e "HH:mm".
+   Usada tanto na disponibilidade quanto no agendamento, para as
+   duas sempre calcularem exatamente o mesmo instante. */
+function construirDataHora(chaveData, horaTexto) {
+  var pd = String(chaveData).split('-');
+  var ph = String(horaTexto).split(':');
+  return new Date(
+    parseInt(pd[0], 10),
+    parseInt(pd[1], 10) - 1,
+    parseInt(pd[2], 10),
+    parseInt(ph[0], 10),
+    parseInt(ph[1], 10),
+    0, 0
+  );
+}
